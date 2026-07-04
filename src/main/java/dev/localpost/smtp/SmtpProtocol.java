@@ -1,6 +1,11 @@
 package dev.localpost.smtp;
 
+import dev.localpost.message.Envelope;
+import dev.localpost.message.MessageParser;
+import dev.localpost.message.ParsedMessage;
 import org.jboss.logging.Logger;
+
+import java.util.List;
 
 /**
  * The SMTP state machine. Given a session and a line from the client,
@@ -15,27 +20,7 @@ public class SmtpProtocol {
 
     public static final String GREETING = "220 localpost ESMTP ready\r\n";
 
-    /**
-     * Signals to the caller that the client sent QUIT and the connection
-     * should be closed after the response is written.
-     */
-    public static class Response {
-        public final String text;
-        public final boolean closeAfter;
-
-        public Response(String text, boolean closeAfter) {
-            this.text = text;
-            this.closeAfter = closeAfter;
-        }
-
-        public static Response reply(String text) {
-            return new Response(text, false);
-        }
-
-        public static Response replyAndClose(String text) {
-            return new Response(text, true);
-        }
-    }
+    private final MessageParser messageParser = new MessageParser();
 
     /**
      * Process one incoming line. Updates session, returns response to send.
@@ -132,19 +117,20 @@ public class SmtpProtocol {
     private Response handleDataLine(SmtpSession session, String line) {
         // Lone dot signals end of message body
         if (line.equals(".")) {
-            String body = session.getMessageBody().toString();
-
-            LOG.infof("""
-                                            
-                            === MESSAGE RECEIVED ===
-                            From: %s
-                            To: %s
-                            Body:
-                            %s
-                            ========================""",
+            String rawBody = session.getMessageBody().toString();
+            Envelope envelope = new Envelope(
                     session.getSender(),
-                    session.getRecipients(),
-                    body);
+                    List.copyOf(session.getRecipients())
+            );
+
+            ParsedMessage parsed = messageParser.parse(rawBody, envelope);
+
+            if (parsed != null) {
+                logParsedMessage(parsed);
+            } else {
+                LOG.warnf("Could not parse message from %s — raw body follows:\n%s",
+                        envelope.sender(), rawBody);
+            }
 
             session.resetMessage();
             return Response.reply("250 2.0.0 Message accepted\r\n");
@@ -188,5 +174,70 @@ public class SmtpProtocol {
 
         int end = rest.indexOf('>');
         return rest.substring(1, end);
+    }
+
+    private void logParsedMessage(ParsedMessage msg) {
+        LOG.infof("""
+                    
+                    === MESSAGE RECEIVED ===
+                    Envelope from: %s
+                    Envelope to:   %s
+                    ---
+                    Header From:    %s
+                    Header To:      %s
+                    Header Cc:      %s
+                    Subject:        %s
+                    Date:           %s
+                    Message-ID:     %s
+                    ---
+                    Text body: %s
+                    HTML body: %s
+                    Attachments: %d
+                    ========================""",
+                msg.envelope().sender(),
+                msg.envelope().recipients(),
+                msg.from(),
+                msg.to(),
+                msg.cc(),
+                msg.subject(),
+                msg.date(),
+                msg.messageId(),
+                summarize(msg.textBody()),
+                summarize(msg.htmlBody()),
+                msg.attachments().size()
+        );
+    }
+
+    private String summarize(String body) {
+        if (body == null) {
+            return "(none)";
+        }
+        String escaped = body.replace("\r", "\\r").replace("\n", "\\n");
+        if (escaped.length() <= 80) {
+            return escaped;
+        }
+        return escaped.substring(0, 80) + "... (" + body.length() + " chars)";
+    }
+
+    /**
+     * Signals to the caller that the client sent QUIT and the connection
+     * should be closed after the response is written.
+     */
+    public static class Response {
+        public final String text;
+        public final boolean closeAfter;
+
+        public Response(String text, boolean closeAfter) {
+            this.text = text;
+            this.closeAfter = closeAfter;
+        }
+
+        public static Response reply(String text) {
+            return new Response(text, false);
+        }
+
+        public static Response replyAndClose(String text) {
+            return new Response(text, true);
+        }
     }
 }
