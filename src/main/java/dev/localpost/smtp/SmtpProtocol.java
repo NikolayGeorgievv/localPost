@@ -142,7 +142,7 @@ public class SmtpProtocol {
         }
 
         session.appendBodyLine(line);
-        return null; // no response during body streaming
+        return Response.NONE; // no response during body streaming
     }
 
     private Response handleQuit() {
@@ -220,17 +220,15 @@ public class SmtpProtocol {
     }
 
     /**
-     * Signals to the caller that the client sent QUIT and the connection
-     * should be closed after the response is written.
+     * A response to send back to the client.
+     *
+     * NONE is a sentinel meaning "the protocol has nothing to say" — used for
+     * message body lines during DATA, which are silently accumulated. It exists
+     * so that no part of the pipeline ever carries a null Response.
      */
-    public static class Response {
-        public final String text;
-        public final boolean closeAfter;
+    public record Response(String text, boolean closeAfter) {
 
-        public Response(String text, boolean closeAfter) {
-            this.text = text;
-            this.closeAfter = closeAfter;
-        }
+        public static final Response NONE = new Response("", false);
 
         public static Response reply(String text) {
             return new Response(text, false);

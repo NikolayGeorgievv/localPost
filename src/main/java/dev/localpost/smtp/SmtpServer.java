@@ -50,14 +50,14 @@ public class SmtpServer {
             while ((line = lineBuffer.nextLine()) != null) {
                 SmtpProtocol.Response response = protocol.handleLine(session, line);
 
-                if (response == null) {
-                    // Silent accept (mid-DATA body line)
+                if (response == SmtpProtocol.Response.NONE) {
+                    // Mid-DATA body line — accumulated, nothing to send
                     continue;
                 }
 
-                socket.write(response.text);
+                socket.write(response.text());
 
-                if (response.closeAfter) {
+                if (response.closeAfter()) {
                     socket.close();
                     break;
                 }
