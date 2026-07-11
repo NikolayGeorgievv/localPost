@@ -2,6 +2,7 @@ package dev.localpost.smtp;
 
 import io.quarkus.runtime.ShutdownEvent;
 import io.quarkus.runtime.StartupEvent;
+import io.vertx.core.Future;
 import io.vertx.core.Vertx;
 import io.vertx.core.net.NetServer;
 import io.vertx.core.net.NetSocket;
@@ -35,36 +36,82 @@ public class SmtpServer {
     private void handleConnection(NetSocket socket) {
         LOG.infof("Client connected: %s", socket.remoteAddress());
 
-        // Each connection gets its own session and line buffer
         SmtpSession session = new SmtpSession();
         LineBuffer lineBuffer = new LineBuffer();
 
-        // Greet the client immediately
         socket.write(SmtpProtocol.GREETING);
 
         socket.handler(buffer -> {
             lineBuffer.append(buffer);
-
-            // Drain all complete lines from the buffer
-            String line;
-            while ((line = lineBuffer.nextLine()) != null) {
-                SmtpProtocol.Response response = protocol.handleLine(session, line);
-
-                if (response == SmtpProtocol.Response.NONE) {
-                    // Mid-DATA body line — accumulated, nothing to send
-                    continue;
-                }
-
-                socket.write(response.text());
-
-                if (response.closeAfter()) {
-                    socket.close();
-                    break;
-                }
-            }
+            drain(socket, session, lineBuffer);
         });
 
         socket.closeHandler(v -> LOG.infof("Client disconnected: %s", socket.remoteAddress()));
+    }
+
+    /**
+     * Pull complete lines out of the buffer and dispatch them, one at a time.
+     *
+     * If a response is not immediately available, we stop: no further lines are
+     * dispatched and the socket is paused. The completion callback resumes and
+     * re-enters this method. This preserves strict request/response ordering even
+     * if the client pipelines commands.
+     */
+    private void drain(NetSocket socket, SmtpSession session, LineBuffer lineBuffer) {
+
+        String line;
+        while ((line = lineBuffer.nextLine()) != null) {
+
+            Future<SmtpProtocol.Response> future = protocol.handleLine(session, line);
+
+            // Fast path: answer already known. Stay in the loop, no thread hop.
+            if (future.isComplete()) {
+                if (!writeResponse(socket, future.result())) {
+                    return;   // connection is closing
+                }
+                continue;
+            }
+
+            // Slow path: the protocol is waiting on something (a DB commit).
+            // Stop taking new bytes, and stop dispatching buffered ones.
+            socket.pause();
+
+            future.onComplete(ar -> {
+                if (ar.succeeded()) {
+                    if (!writeResponse(socket, ar.result())) {
+                        return;
+                    }
+                } else {
+                    // Protocol layer is expected to recover failures into a 451.
+                    // Reaching here means a bug - fail loudly, don't hang the client.
+                    LOG.error("Unhandled failure in protocol layer", ar.cause());
+                    socket.write(SmtpProtocol.INTERNAL_ERROR);
+                }
+
+                socket.resume();
+                drain(socket, session, lineBuffer);
+            });
+            // the callback owns the loop from here
+            return;
+        }
+    }
+
+    /**
+     * @return true to keep draining, false if the connection is closing.
+     */
+    private boolean writeResponse(NetSocket socket, SmtpProtocol.Response response) {
+        if (response == SmtpProtocol.Response.NONE) {
+            // mid-DATA body line - nothing to send
+            return true;
+        }
+
+        socket.write(response.text());
+
+        if (response.closeAfter()) {
+            socket.close();
+            return false;
+        }
+        return true;
     }
 
     void onStop(@Observes ShutdownEvent ev) {

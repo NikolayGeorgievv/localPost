@@ -3,6 +3,7 @@ package dev.localpost.smtp;
 import dev.localpost.message.Envelope;
 import dev.localpost.message.MessageParser;
 import dev.localpost.message.ParsedMessage;
+import io.vertx.core.Future;
 import org.jboss.logging.Logger;
 
 import java.util.List;
@@ -19,30 +20,39 @@ public class SmtpProtocol {
     private static final Logger LOG = Logger.getLogger(SmtpProtocol.class);
 
     public static final String GREETING = "220 localpost ESMTP ready\r\n";
+    public static final String INTERNAL_ERROR = "451 4.3.0 Internal error\r\n";
 
     private final MessageParser messageParser = new MessageParser();
 
     /**
-     * Process one incoming line. Updates session, returns response to send.
+     * Process one incoming line. Returns a Future because at the end of DATA
+     * the response depends on persistence, which happens off the event loop.
+     * Every other command answers immediately.
      */
-    public Response handleLine(SmtpSession session, String line) {
+    public Future<Response> handleLine(SmtpSession session, String line) {
 
-        // During DATA_RECEIVING, lines are message body, not commands
         if (session.getState() == SmtpState.DATA_RECEIVING) {
             return handleDataLine(session, line);
         }
 
-        // Otherwise, parse the verb and dispatch
+        return Future.succeededFuture(handleCommand(session, line));
+    }
+
+    /**
+     * The command switch. Synchronous — no command outside DATA needs to wait
+     * on anything.
+     */
+    private Response handleCommand(SmtpSession session, String line) {
         String verb = extractVerb(line);
         return switch (verb) {
             case "HELO", "EHLO" -> handleHelo(session, line);
-            case "MAIL" -> handleMailFrom(session, line);
-            case "RCPT" -> handleRcptTo(session, line);
-            case "DATA" -> handleData(session);
-            case "QUIT" -> handleQuit();
-            case "RSET" -> handleRset(session);
-            case "NOOP" -> Response.reply("250 OK\r\n");
-            default -> Response.reply("500 5.5.2 Command unrecognized\r\n");
+            case "MAIL"         -> handleMailFrom(session, line);
+            case "RCPT"         -> handleRcptTo(session, line);
+            case "DATA"         -> handleData(session);
+            case "QUIT"         -> handleQuit();
+            case "RSET"         -> handleRset(session);
+            case "NOOP"         -> Response.reply("250 OK\r\n");
+            default             -> Response.reply("500 5.5.2 Command unrecognized\r\n");
         };
     }
 
@@ -114,7 +124,7 @@ public class SmtpProtocol {
         return Response.reply("354 End data with <CR><LF>.<CR><LF>\r\n");
     }
 
-    private Response handleDataLine(SmtpSession session, String line) {
+    private Future<Response> handleDataLine(SmtpSession session, String line) {
         // Lone dot signals end of message body
         if (line.equals(".")) {
             String rawBody = session.getMessageBody().toString();
@@ -133,7 +143,7 @@ public class SmtpProtocol {
             }
 
             session.resetMessage();
-            return Response.reply("250 2.0.0 Message accepted\r\n");
+            return Future.succeededFuture(Response.reply("250 2.0.0 Message accepted\r\n"));
         }
 
         // Dot-stuffing: line starting with ".." means literal ".", strip one dot
@@ -142,7 +152,7 @@ public class SmtpProtocol {
         }
 
         session.appendBodyLine(line);
-        return Response.NONE; // no response during body streaming
+        return Future.succeededFuture(Response.NONE);
     }
 
     private Response handleQuit() {
